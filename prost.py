@@ -78,9 +78,6 @@ if __name__ == "__main__":
 
     fn_out = pathlib.Path(f'embeddings_prost.h5')
 
-    #https://github.com/pytorch/pytorch/issues/52286
-    #torch._C._jit_set_bailout_depth(0) # Use _jit_set_fusion_strategy, bailout depth is deprecated.
-    
     model = torch.jit.load('traced_esm1b_25_13.pt').eval()
     alphabet = Alphabet.from_architecture("ESM-1b")
     batch_converter = alphabet.get_batch_converter()
@@ -108,25 +105,27 @@ if __name__ == "__main__":
         for i in range(len(results)):
             results[i] = results[i].to(device="cpu")[0].detach().numpy()
         return results
-    
-    def embed(seq):
-        l = len(seq)
+
+    def _embed_chunked(seq):
         embtoks = None
-        if l > 1022:
-            piece = int(l/1022)+1
-            part = l/piece
-            for i in range(piece):
-                st = int(i*part)
-                sp = int((i+1)*part)
-                results = _embed(seq[st:sp])
-                if embtoks is not None:
-                    for i in range(len(results)):
-                        embtoks[i] = np.concatenate((embtoks[i][:len(embtoks[i])-1],results[i][1:]),axis=0)
-                else:
-                    embtoks = results
-        else:
-            embtoks = _embed(seq)
+        l = len(seq)
+        piece = int(l / 1022) + 1
+        part = l / piece
+        for i in range(piece):
+            st = int(i * part)
+            sp = int((i + 1) * part)
+            results = _embed(seq[st:sp])
+            if embtoks is not None:
+                for i in range(len(results)):
+                    embtoks[i] = np.concatenate((embtoks[i][:len(embtoks[i]) - 1],results[i][1:]),axis=0)
+            else:
+                embtoks = results
         return embtoks
+
+
+    def embed(seq):
+        seq = seq.upper()
+        return _embed_chunked(seq) if len(seq) > 1022 else _embed(seq)
 
     for fasta_file in fasta_files:
         species = fasta_file.split('/')[-1].split('.')[0]
@@ -143,7 +142,7 @@ if __name__ == "__main__":
 
         sequence_labels = []
         sequence_representations = []
-        with torch.no_grad():
+        with torch.inference_mode():
             for i, (name, seq) in enumerate(fasta_iter):
                 print(
                     f"Processing sequence {i + 1}"
@@ -151,7 +150,7 @@ if __name__ == "__main__":
 
                 # Embed in chunks if longer than 1022
                 if seq:
-                    esm_output = embed(seq.upper())
+                    esm_output = embed(seq)
                     q25_544 = quant2D(esm_output[1], 5, 44)
                     q13_385 = quant2D(esm_output[0], 3, 85)
                     quantised = np.concatenate([q25_544,q13_385])
