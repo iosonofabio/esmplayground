@@ -1,5 +1,7 @@
 import os
 import sys
+import gc
+import time
 import argparse
 import pathlib
 import glob
@@ -23,7 +25,8 @@ def create_parser():
     return parser
 
 
-# Straight from: https://github.com/MesihK/prost/blob/master/src/pyprost/prosttools.py
+# The following functions are PROST, straight from:
+# https://github.com/MesihK/prost/blob/master/src/pyprost/prosttools.py
 def iterate_fasta(fastafile):
     from itertools import groupby
     with open(fastafile) as fh:
@@ -34,25 +37,62 @@ def iterate_fasta(fastafile):
             yield header, seq
 
 
-def standard_scale(v):
-    M = np.max(v)
-    m = np.min(v)
-    return (v - m) / float(M - m)
+def embed_protein_sequence(seq, model, batch_converter):
+    '''Embed protein sequence into vector space'''
+    def _embed(seq):
+        # Tokenise
+        # TODO: Surely there's a better way to do this?
+        _, _, toks = batch_converter([("prot", seq)])
+        if torch.cuda.is_available() and not args.nogpu:
+            toks = toks.to(device="cuda", non_blocking=True)
+
+        # Call ESM1b on the tokens
+        results = model(toks)
+        
+        # Fetch results
+        for i in range(len(results)):
+            results[i] = results[i].to(device="cpu")[0].detach().numpy()
+        return results
+
+    def _embed_chunked(seq):
+        embtoks = None
+        l = len(seq)
+        piece = int(l / 1022) + 1
+        part = l / piece
+        for i in range(piece):
+            st = int(i * part)
+            sp = int((i + 1) * part)
+            results = _embed(seq[st:sp])
+            if embtoks is not None:
+                for i in range(len(results)):
+                    embtoks[i] = np.concatenate((embtoks[i][:len(embtoks[i]) - 1],results[i][1:]),axis=0)
+            else:
+                embtoks = results
+        return embtoks
+
+    seq = seq.upper()
+    return _embed_chunked(seq) if len(seq) > 1022 else _embed(seq)
 
 
-def iDCTquant(v, n):
-    f = dct(v.T, type=2, norm='ortho')
-    trans = idct(f[:,:n], type=2, norm='ortho')
-    for i in range(len(trans)):
-        trans[i] = standard_scale(trans[i])
-    return trans.T
+def quantise_protein_vector_2D(emb, n=5, m=44):
+    '''Quantise protein vector'''
+    def _standard_scale(v):
+        M = np.max(v)
+        m = np.min(v)
+        return (v - m) / float(M - m)
+    
+    
+    def _iDCTquant(v, n):
+        f = dct(v.T, type=2, norm='ortho')
+        trans = idct(f[:, :n], type=2, norm='ortho')
+        for i in range(len(trans)):
+            trans[i] = _standard_scale(trans[i])
+        return trans.T
 
-
-def quant2D(emb, n=5, m=44):
     # First and last tokens are BoS and EoS
-    dct = iDCTquant(emb[1: len(emb) - 1], n)
-    ddct = iDCTquant(dct.T, m).T
-    ddct = ddct.reshape(n*m)
+    dct = _iDCTquant(emb[1: len(emb) - 1], n)
+    ddct = _iDCTquant(dct.T, m).T
+    ddct = ddct.reshape(n * m)
     # Convert 0-1 to actual uint8
     return (ddct * 127).astype('int8')
 
@@ -97,36 +137,6 @@ if __name__ == "__main__":
         model = torch.jit.freeze(model)
         model = torch.jit.optimize_for_inference(model)
     
-    def _embed(seq):
-        _, _, toks = batch_converter([("prot",seq)])
-        if torch.cuda.is_available() and not args.nogpu:
-            toks = toks.to(device="cuda", non_blocking=True)
-        results = model(toks)
-        for i in range(len(results)):
-            results[i] = results[i].to(device="cpu")[0].detach().numpy()
-        return results
-
-    def _embed_chunked(seq):
-        embtoks = None
-        l = len(seq)
-        piece = int(l / 1022) + 1
-        part = l / piece
-        for i in range(piece):
-            st = int(i * part)
-            sp = int((i + 1) * part)
-            results = _embed(seq[st:sp])
-            if embtoks is not None:
-                for i in range(len(results)):
-                    embtoks[i] = np.concatenate((embtoks[i][:len(embtoks[i]) - 1],results[i][1:]),axis=0)
-            else:
-                embtoks = results
-        return embtoks
-
-
-    def embed(seq):
-        seq = seq.upper()
-        return _embed_chunked(seq) if len(seq) > 1022 else _embed(seq)
-
     for fasta_file in fasta_files:
         species = fasta_file.split('/')[-1].split('.')[0]
         print(species)
@@ -142,32 +152,43 @@ if __name__ == "__main__":
 
         sequence_labels = []
         sequence_representations = []
+        times = []
+        lengths = []
+        errors = []
         with torch.inference_mode():
             for i, (name, seq) in enumerate(fasta_iter):
-                print(
-                    f"Processing sequence {i + 1}"
-                )
+                print(f"Processing sequence {i + 1}", end='\r')
+                if len(seq) == 0:
+                    continue
 
-                # Embed in chunks if longer than 1022
-                if seq:
-                    esm_output = embed(seq)
-                    q25_544 = quant2D(esm_output[1], 5, 44)
-                    q13_385 = quant2D(esm_output[0], 3, 85)
+                try:
+                    t0 = time.time()
+                    # Embed in chunks if longer than 1022
+                    esm_output = embed_protein_sequence(seq, model, batch_converter)
+                    q25_544 = quantise_protein_vector_2D(esm_output[1], 5, 44)
+                    q13_385 = quantise_protein_vector_2D(esm_output[0], 3, 85)
                     quantised = np.concatenate([q25_544,q13_385])
-                else:
-                    quantised = np.zeros(475, 'u1')
+                    t1 = time.time()
+                except:
+                    print()
+                    print(name, seq)
+                    errors.append((name, seq))
+                    continue
 
                 # Accumulate outputs
                 sequence_labels.append(name)
                 sequence_representations.append(quantised)
+                lengths.append(len(seq))
+                times.append(t1 - t0)
 
-                if i + 1 == args.max_sequences:
+                if (args.max_sequences != -1) and (i + 1 >= args.max_sequences):
                     break
+            print(f'All done: {i+1} sequences')
 
         sequence_representations = np.vstack(sequence_representations)
 
         print('Store to file')
-        comp_kwargs = hdf5plugin.Zstd(clevel=compression)
+        comp_kwargs = hdf5plugin.Zstd(clevel=22)
         with h5py.File(fn_out, 'a') as h5:
             if species in h5:
                 h5.pop(species)
@@ -176,9 +197,7 @@ if __name__ == "__main__":
                 'features',
                 data=np.array(sequence_labels).astype('S'),
             )
-            speciesg.create_dataset(
-                'embeddings',
-                data=sequence_representations,
-                dtype='u1',
-            )
+            speciesg.create_dataset('embeddings', data=sequence_representations, dtype='u1')
 
+        del times, lengths, sequence_representations, sequence_labels
+        gc.collect()

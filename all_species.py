@@ -172,7 +172,7 @@ if __name__ == "__main__":
                     sequence_representations.append(sequence_repr)
 
         print('Store to file')
-        comp_kwargs = hdf5plugin.Zstd(clevel=compression)
+        comp_kwargs = hdf5plugin.Zstd(clevel=22)
         with h5py.File(fn_out, 'a') as h5:
             if species in h5:
                 h5.pop(species)
